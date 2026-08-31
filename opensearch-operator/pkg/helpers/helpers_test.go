@@ -6,6 +6,7 @@ import (
 	opensearchv1 "github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/api/opensearch.org/v1"
 	k8smocks "github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/mocks/github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
 	"github.com/stretchr/testify/mock"
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -693,6 +694,103 @@ var _ = Describe("EnsureDashboardsCredentialsSecret", func() {
 		Expect(created).ToNot(BeNil())
 		Expect(created.StringData["username"]).To(Equal("kibanaserver"))
 		expectPolicyCompliant(created.StringData["password"])
+	})
+})
+
+var _ = Describe("BuildGeneratedSecurityConfigSecret", func() {
+	// internal_users.yml is only ever supplied by securityConfigSecret at
+	// bootstrap (see the API's $SECURITYCONFIG_REF) - callers withhold it on
+	// every reconcile after that so a customer's own Dashboards-created
+	// users, or users this operator doesn't track (e.g. apiuser,
+	// monitoring), never get clobbered by a stock-demo substitute.
+	It("leaves internalusers alone when securityConfigSecret doesn't supply internal_users.yml", func() {
+		cr := &opensearchv1.OpenSearchCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "gentest", Namespace: "gentest"},
+			Spec: opensearchv1.ClusterSpec{
+				Security: &opensearchv1.Security{
+					Config: &opensearchv1.SecurityConfig{
+						SecurityconfigSecret: corev1.LocalObjectReference{Name: "userSecret"},
+					},
+				},
+			},
+		}
+		adminSecret := &corev1.Secret{Data: map[string][]byte{"password": []byte("adminpass")}}
+
+		mockClient := k8smocks.NewMockK8sClient(GinkgoT())
+		mockClient.EXPECT().GetSecret("userSecret", "gentest").Return(corev1.Secret{
+			Data: map[string][]byte{"config.yml": []byte("_meta:\n  type: config\n")},
+		}, nil).Once()
+		// No further GetSecret/CreateSecret calls are expected - if the
+		// implementation reaches for the dashboards credentials secret or
+		// the existing generated secret anyway, this mock has no
+		// expectation for it and the test fails.
+
+		secret, err := BuildGeneratedSecurityConfigSecret(mockClient, cr, adminSecret)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secret.Data).To(HaveKey("config.yml"))
+		Expect(secret.Data).NotTo(HaveKey("internal_users.yml"))
+	})
+
+	It("injects a fresh admin/kibanaserver hash when securityConfigSecret supplies internal_users.yml (bootstrap)", func() {
+		cr := &opensearchv1.OpenSearchCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "gentest", Namespace: "gentest"},
+			Spec: opensearchv1.ClusterSpec{
+				Security: &opensearchv1.Security{
+					Config: &opensearchv1.SecurityConfig{
+						SecurityconfigSecret: corev1.LocalObjectReference{Name: "bootstrapSecret"},
+					},
+				},
+			},
+		}
+		adminSecret := &corev1.Secret{Data: map[string][]byte{"password": []byte("adminpass")}}
+		bootstrapInternalUsers := `
+_meta:
+  type: "internalusers"
+  config_version: 2
+admin:
+  reserved: true
+  backend_roles:
+    - "admin"
+  description: "Admin user"
+kibanaserver:
+  reserved: true
+  description: "Demo user for the OpenSearch Dashboards server"
+apiuser:
+  reserved: true
+  backend_roles:
+    - "admin"
+  description: "Used by the API for its own privileged calls"
+`
+		generatedName := GeneratedSecurityConfigSecretName(cr)
+		dashboardsSecretName := GeneratedDashboardsCredentialsSecretName(cr)
+		notFound := &k8serrors.StatusError{ErrStatus: metav1.Status{Reason: metav1.StatusReasonNotFound}}
+
+		mockClient := k8smocks.NewMockK8sClient(GinkgoT())
+		mockClient.EXPECT().GetSecret("bootstrapSecret", "gentest").Return(corev1.Secret{
+			Data: map[string][]byte{"internal_users.yml": []byte(bootstrapInternalUsers)},
+		}, nil).Once()
+		mockClient.EXPECT().GetSecret(dashboardsSecretName, "gentest").Return(corev1.Secret{
+			Data: map[string][]byte{"password": []byte("dashboardspass")},
+		}, nil).Once()
+		mockClient.EXPECT().GetSecret(generatedName, "gentest").Return(corev1.Secret{}, notFound).Once()
+
+		secret, err := BuildGeneratedSecurityConfigSecret(mockClient, cr, adminSecret)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secret.Data).To(HaveKey("internal_users.yml"))
+
+		var result map[string]interface{}
+		Expect(yaml.Unmarshal(secret.Data["internal_users.yml"], &result)).To(Succeed())
+
+		// apiuser (this operator never touches it) must survive untouched.
+		Expect(result).To(HaveKey("apiuser"))
+
+		admin, ok := result["admin"].(map[interface{}]interface{})
+		Expect(ok).To(BeTrue())
+		Expect(bcrypt.CompareHashAndPassword([]byte(admin["hash"].(string)), []byte("adminpass"))).To(Succeed())
+
+		kibanaserver, ok := result["kibanaserver"].(map[interface{}]interface{})
+		Expect(ok).To(BeTrue())
+		Expect(bcrypt.CompareHashAndPassword([]byte(kibanaserver["hash"].(string)), []byte("dashboardspass"))).To(Succeed())
 	})
 })
 

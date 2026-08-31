@@ -649,11 +649,19 @@ done;`
 			generatedConfigName := helpers.GeneratedSecurityConfigSecretName(&spec)
 			mockClient.EXPECT().GetSecret(adminCredsName, externalClusterName).Return(adminCredSecret, nil)
 			mockClient.EXPECT().GetSecret("securityconfig-secret", externalClusterName).Return(*securityConfigSecret, nil)
-			setupDashboardsCredentialsSecretMocks(mockClient, externalClusterName)
+			// securityConfigSecret here only supplies config.yml, no
+			// internal_users.yml - the dashboards credentials secret is
+			// never touched in that case (see BuildGeneratedSecurityConfigSecret),
+			// so unlike other tests in this file there's no
+			// setupDashboardsCredentialsSecretMocks call here.
 			mockClient.EXPECT().GetJob(externalClusterName+"-securityconfig-update", externalClusterName).Return(batchv1.Job{}, NotFoundError())
 			mockClient.EXPECT().Scheme().Return(scheme.Scheme)
 			mockClient.On("UpdateOpenSearchClusterStatus", mock.Anything, mock.Anything).Return(nil).Maybe()
-			mockClient.On("GetSecret", generatedConfigName, externalClusterName).Return(corev1.Secret{}, NotFoundError()).Once()
+			// No preliminary GetSecret(generatedConfigName) here (unlike
+			// other tests in this file) - that lookup is only made to
+			// compare against an existing internal_users.yml hash, which
+			// BuildGeneratedSecurityConfigSecret skips entirely when
+			// internal_users.yml isn't supplied, as it isn't here.
 
 			var generatedConfigSecret *corev1.Secret
 			mockClient.On("ReconcileResource", mock.AnythingOfType("*v1.Secret"), mock.Anything).
