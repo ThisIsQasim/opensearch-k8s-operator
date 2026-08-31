@@ -381,12 +381,23 @@ func EnsureAdminCredentialsSecret(k8sClient k8s.K8sClient, cr *opensearchv1.Open
 }
 
 func BuildGeneratedSecurityConfigSecret(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster, adminSecret *corev1.Secret) (*corev1.Secret, error) {
-	baseData, err := defaultSecurityconfigData()
-	if err != nil {
-		return nil, err
-	}
+	hasUserSecret := cr.Spec.Security != nil && cr.Spec.Security.Config != nil && cr.Spec.Security.Config.SecurityconfigSecret.Name != ""
 
-	if cr.Spec.Security != nil && cr.Spec.Security.Config != nil && cr.Spec.Security.Config.SecurityconfigSecret.Name != "" {
+	baseData := map[string][]byte{}
+	if !hasUserSecret {
+		// No securityConfigSecret configured at all - the documented,
+		// fully hands-off mode ("the operator seeds the cluster with its
+		// bundled defaults", SecurityConfig.SecurityconfigSecret's doc
+		// comment). Distinct from the case just below: here there's no
+		// user-supplied file of any kind to respect withholding a key
+		// out of, so the bundled stock demo config is the only source
+		// there ever was for this cluster.
+		var err error
+		baseData, err = defaultSecurityconfigData()
+		if err != nil {
+			return nil, err
+		}
+	} else {
 		userSecret, err := k8sClient.GetSecret(cr.Spec.Security.Config.SecurityconfigSecret.Name, cr.Namespace)
 		if err != nil {
 			return nil, err
@@ -396,66 +407,80 @@ func BuildGeneratedSecurityConfigSecret(k8sClient k8s.K8sClient, cr *opensearchv
 		}
 	}
 
-	adminPassword, passwordExists := adminSecret.Data["password"]
-	if !passwordExists {
-		return nil, errors.New("admin credentials secret missing password field")
-	}
-
-	dashboardsSecret, _, err := EnsureDashboardsCredentialsSecret(k8sClient, cr)
-	if err != nil {
-		return nil, err
-	}
-	var dashboardsPassword []byte
-	dashboardsUsername := "kibanaserver"
-	if dashboardsSecret != nil {
-		if pwd, exists := dashboardsSecret.Data["password"]; exists {
-			dashboardsPassword = pwd
-		}
-		if username, exists := dashboardsSecret.Data["username"]; exists && len(username) > 0 {
-			dashboardsUsername = string(username)
-		}
-	}
-	if len(dashboardsPassword) == 0 {
-		return nil, errors.New("dashboards credentials secret missing password field")
-	}
-
-	internalUsers, ok := baseData["internal_users.yml"]
-	if !ok {
-		return nil, errors.New("securityconfig missing internal_users.yml")
-	}
-
 	generatedName := GeneratedSecurityConfigSecretName(cr)
-	var existingGenerated *corev1.Secret
-	existingSecret, err := k8sClient.GetSecret(generatedName, cr.Namespace)
-	if err == nil {
-		existingGenerated = &existingSecret
-	} else if !k8serrors.IsNotFound(err) {
-		return nil, err
-	}
 
-	var adminHashOverride, dashboardsHashOverride string
-	if existingGenerated != nil {
-		if existingInternal, exists := existingGenerated.Data["internal_users.yml"]; exists {
-			// Generic map lookup rather than InternalUserConfig, since the Dashboards
-			// user entry can live under any username (dashboardsUsername), not just
-			// the hardcoded "kibanaserver" key.
-			var existingConfig map[string]interface{}
-			if err := yaml.Unmarshal(existingInternal, &existingConfig); err == nil {
-				if hash := existingUserHash(existingConfig, "admin"); hash != "" && bcrypt.CompareHashAndPassword([]byte(hash), adminPassword) == nil {
-					adminHashOverride = hash
-				}
-				if hash := existingUserHash(existingConfig, dashboardsUsername); hash != "" && bcrypt.CompareHashAndPassword([]byte(hash), dashboardsPassword) == nil {
-					dashboardsHashOverride = hash
+	// internal_users.yml is only ever supplied by a *configured*
+	// securityConfigSecret during initial bootstrap - callers deliberately
+	// withhold it on every reconcile after that (see the API's
+	// $SECURITYCONFIG_REF), so a customer's own OpenSearch
+	// Dashboards-created users, and any users this operator isn't
+	// tracking (apiuser, monitoring, ...), never get clobbered. Respect
+	// that the same way every other config type here already does: if a
+	// securityConfigSecret is configured but doesn't supply this file,
+	// leave the internalusers type alone entirely - no bundled stock-demo
+	// substitute, no hash injection, nothing added to the generated
+	// secret for it at all. (The `!hasUserSecret` branch above is the
+	// only other way this key ends up populated, and that's the
+	// intentional bundled-defaults mode, not a withheld file.)
+	if internalUsers, ok := baseData["internal_users.yml"]; ok {
+		adminPassword, passwordExists := adminSecret.Data["password"]
+		if !passwordExists {
+			return nil, errors.New("admin credentials secret missing password field")
+		}
+
+		// EnsureDashboardsCredentialsSecret only needs to run (and only
+		// needs to succeed) when there's an internal_users.yml to inject
+		// a hash into - skip it entirely on every other reconcile.
+		dashboardsSecret, _, err := EnsureDashboardsCredentialsSecret(k8sClient, cr)
+		if err != nil {
+			return nil, err
+		}
+		var dashboardsPassword []byte
+		dashboardsUsername := "kibanaserver"
+		if dashboardsSecret != nil {
+			if pwd, exists := dashboardsSecret.Data["password"]; exists {
+				dashboardsPassword = pwd
+			}
+			if username, exists := dashboardsSecret.Data["username"]; exists && len(username) > 0 {
+				dashboardsUsername = string(username)
+			}
+		}
+		if len(dashboardsPassword) == 0 {
+			return nil, errors.New("dashboards credentials secret missing password field")
+		}
+
+		var existingGenerated *corev1.Secret
+		existingSecret, err := k8sClient.GetSecret(generatedName, cr.Namespace)
+		if err == nil {
+			existingGenerated = &existingSecret
+		} else if !k8serrors.IsNotFound(err) {
+			return nil, err
+		}
+
+		var adminHashOverride, dashboardsHashOverride string
+		if existingGenerated != nil {
+			if existingInternal, exists := existingGenerated.Data["internal_users.yml"]; exists {
+				// Generic map lookup rather than InternalUserConfig, since the Dashboards
+				// user entry can live under any username (dashboardsUsername), not just
+				// the hardcoded "kibanaserver" key.
+				var existingConfig map[string]interface{}
+				if err := yaml.Unmarshal(existingInternal, &existingConfig); err == nil {
+					if hash := existingUserHash(existingConfig, "admin"); hash != "" && bcrypt.CompareHashAndPassword([]byte(hash), adminPassword) == nil {
+						adminHashOverride = hash
+					}
+					if hash := existingUserHash(existingConfig, dashboardsUsername); hash != "" && bcrypt.CompareHashAndPassword([]byte(hash), dashboardsPassword) == nil {
+						dashboardsHashOverride = hash
+					}
 				}
 			}
 		}
-	}
 
-	internalUsers, err = applyUserHashes(internalUsers, adminPassword, adminHashOverride, dashboardsUsername, dashboardsPassword, dashboardsHashOverride)
-	if err != nil {
-		return nil, err
+		internalUsers, err = applyUserHashes(internalUsers, adminPassword, adminHashOverride, dashboardsUsername, dashboardsPassword, dashboardsHashOverride)
+		if err != nil {
+			return nil, err
+		}
+		baseData["internal_users.yml"] = internalUsers
 	}
-	baseData["internal_users.yml"] = internalUsers
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
